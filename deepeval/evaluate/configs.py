@@ -21,6 +21,7 @@ class AsyncConfig:
 class DisplayConfig:
     show_indicator: bool = True
     print_results: bool = True
+    display_post_test: bool = True
     verbose_mode: Optional[bool] = None
     display_option: Optional[TestRunResultDisplay] = TestRunResultDisplay.ALL
 

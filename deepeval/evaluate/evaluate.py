@@ -239,7 +239,7 @@ def evaluate(
             aggregate_metric_pass_rates(test_results)
 
         confident_link = global_test_run_manager.wrap_up_test_run(
-            run_duration, display_table=False
+            run_duration, display_table=False, display_post_test=display_config.display_post_test,
         )
         return EvaluationResult(
             test_results=test_results, confident_link=confident_link
@@ -302,7 +302,7 @@ def evaluate(
         test_run.hyperparameters = process_hyperparameters(hyperparameters)
         global_test_run_manager.save_test_run()
         confident_link = global_test_run_manager.wrap_up_test_run(
-            run_duration, display_table=False
+            run_duration, display_table=False, display_post_test=display_config.display_post_test,
         )
         return EvaluationResult(
             test_results=test_results, confident_link=confident_link

@@ -773,7 +773,7 @@ class TestRunManager:
             f"Total estimated evaluation tokens cost: {test_run.evaluation_cost} USD"
         )
 
-    def post_test_run(self, test_run: TestRun) -> Optional[str]:
+    def post_test_run(self, test_run: TestRun, display_post_test=True) -> Optional[str]:
         # # TODO: remove later
         # if any(
         #     test_case.trace is not None for test_case in test_run.test_cases
@@ -892,12 +892,13 @@ class TestRunManager:
                 webbrowser.open(link)
 
             return link
-        else:
+        elif display_post_test:
             console.print(
                 "\n[rgb(5,245,141)]✓[/rgb(5,245,141)] Tests finished 🎉! Run [bold]'deepeval login'[/bold] to save and analyze evaluation results on Confident AI.\n",
                 LOGIN_PROMPT,
                 "\n",
             )
+        return None
 
     def save_test_run_locally(self):
         local_folder = os.getenv("DEEPEVAL_RESULTS_FOLDER")
@@ -923,6 +924,7 @@ class TestRunManager:
         self,
         runDuration: float,
         display_table: bool = True,
+        display_post_test: bool = True,
         display: Optional[TestRunResultDisplay] = TestRunResultDisplay.ALL,
     ) -> Optional[str]:
         test_run = self.get_test_run()
@@ -969,7 +971,7 @@ class TestRunManager:
             or len(test_run.conversational_test_cases) > 0
         ):
             test_run.guard_mllm_test_cases()
-            return self.post_test_run(test_run)
+            return self.post_test_run(test_run, display_post_test=display_post_test)
 
 
 global_test_run_manager = TestRunManager()
