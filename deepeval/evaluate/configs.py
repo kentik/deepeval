@@ -24,6 +24,7 @@ class DisplayConfig:
     display_post_test: bool = True
     verbose_mode: Optional[bool] = None
     display_option: Optional[TestRunResultDisplay] = TestRunResultDisplay.ALL
+    file_output_dir: Optional[str] = None
 
 
 @dataclass
