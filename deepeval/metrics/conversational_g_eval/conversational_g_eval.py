@@ -4,7 +4,7 @@ from openai.types.chat.chat_completion import ChatCompletion
 from typing import Optional, List, Tuple, Union, Dict
 import math
 from deepeval.metrics import BaseMetric
-from deepeval.metrics.g_eval.g_eval import construct_g_eval_params_string
+from deepeval.metrics.g_eval.utils import construct_g_eval_params_string
 from deepeval.test_case import (
     LLMTestCase,
     LLMTestCaseParams,
@@ -73,17 +73,24 @@ class ConversationalGEval(BaseMetric):
         self,
         test_case: ConversationalTestCase,
         _show_indicator: bool = True,
+        _in_component: bool = False,
     ) -> float:
         check_conversational_test_case_params(
             test_case, self.evaluation_params, self
         )
 
         self.evaluation_cost = 0 if self.using_native_model else None
-        with metric_progress_indicator(self, _show_indicator=_show_indicator):
+        with metric_progress_indicator(
+            self, _show_indicator=_show_indicator, _in_component=_in_component
+        ):
             if self.async_mode:
                 loop = get_or_create_event_loop()
                 loop.run_until_complete(
-                    self.a_measure(test_case, _show_indicator=False)
+                    self.a_measure(
+                        test_case,
+                        _show_indicator=False,
+                        _in_component=_in_component,
+                    )
                 )
             else:
                 self.evaluation_steps: List[str] = (
@@ -112,6 +119,7 @@ class ConversationalGEval(BaseMetric):
         self,
         test_case: ConversationalTestCase,
         _show_indicator: bool = True,
+        _in_component: bool = False,
     ) -> float:
         check_conversational_test_case_params(
             test_case, self.evaluation_params, self
@@ -122,6 +130,7 @@ class ConversationalGEval(BaseMetric):
             self,
             async_mode=True,
             _show_indicator=_show_indicator,
+            _in_component=_in_component,
         ):
             self.evaluation_steps: List[str] = (
                 await self._a_generate_evaluation_steps()
