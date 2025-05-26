@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Literal, Optional, Set, Union, Callable
+from deepeval.telemetry import capture_send_trace
 from deepeval.tracing.utils import (
     Environment,
     validate_environment,
@@ -15,7 +16,6 @@ import inspect
 import asyncio
 import random
 import atexit
-import signal
 import queue
 import uuid
 import sys
@@ -218,6 +218,10 @@ class Trace(BaseModel):
     end_time: Union[float, None] = Field(None, serialization_alias="endTime")
     tags: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
+    thread_id: Optional[str] = None
+    user_id: Optional[str] = None
+    input: Optional[Any] = None
+    output: Optional[Any] = None
 
 
 # Create a context variable to track the current span
@@ -256,6 +260,7 @@ class TraceManager:
         self.evaluating = False
 
         # trace manager attributes
+        self.confident_api_key = None
         self.custom_mask_fn: Optional[Callable] = None
         self.environment = os.environ.get(
             CONFIDENT_TRACE_ENVIRONMENT, Environment.DEVELOPMENT.value
@@ -267,19 +272,6 @@ class TraceManager:
 
         # Register an exit handler to warn about unprocessed traces
         atexit.register(self._warn_on_exit)
-        signal.signal(signal.SIGINT, self._on_signal)
-        signal.signal(signal.SIGTERM, self._on_signal)
-
-    def _on_signal(self, signum, frame):
-        queue_size = self._trace_queue.qsize()
-        in_flight = len(self._in_flight_tasks)
-        remaining_tasks = queue_size + in_flight
-        if os.getenv(CONFIDENT_TRACE_FLUSH) != "YES" and remaining_tasks > 0:
-            self._print_trace_status(
-                message=f"INTERRUPTED: Exiting with {queue_size + in_flight} trace(s) remaining to be posted.",
-                trace_worker_status=TraceWorkerStatus.WARNING,
-            )
-        sys.exit(0)
 
     def _warn_on_exit(self):
         queue_size = self._trace_queue.qsize()
@@ -303,6 +295,7 @@ class TraceManager:
         mask: Optional[Callable] = None,
         environment: Optional[str] = None,
         sampling_rate: Optional[float] = None,
+        confident_api_key: Optional[str] = None,
     ) -> None:
         if mask is not None:
             self.custom_mask_fn = mask
@@ -312,6 +305,8 @@ class TraceManager:
         if sampling_rate is not None:
             validate_sampling_rate(sampling_rate)
             self.sampling_rate = sampling_rate
+        if confident_api_key is not None:
+            self.confident_api_key = confident_api_key
 
     def start_new_trace(self) -> Trace:
         """Start a new trace and set it as the current trace."""
@@ -446,6 +441,42 @@ class TraceManager:
             else:
                 console.print(message_prefix, env_text, message)
 
+    def _should_sample_trace(self) -> bool:
+        random_number = random.random()
+        if random_number > self.sampling_rate:
+            rate_str = f"{self.sampling_rate:.2f}"
+            self._print_trace_status(
+                message=f"Skipped posting trace due to sampling rate ({rate_str})",
+                trace_worker_status=TraceWorkerStatus.SUCCESS,
+            )
+            return False
+
+        return True
+
+    def _ensure_worker_thread_running(self):
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self._worker_thread = threading.Thread(
+                target=self._process_trace_queue,
+                daemon=self._daemon,
+            )
+            self._worker_thread.start()
+
+    def post_trace_api(self, trace_api: TraceApi) -> Optional[str]:
+        if not is_confident():
+            self._print_trace_status(
+                message="No Confident AI API key found. Skipping trace posting.",
+                trace_worker_status=TraceWorkerStatus.FAILURE,
+            )
+            return None
+
+        if not self._should_sample_trace():
+            return None
+
+        self._ensure_worker_thread_running()
+        self._trace_queue.put(trace_api)
+
+        return "ok"
+
     def post_trace(self, trace: Trace) -> Optional[str]:
         if not is_confident():
             self._print_trace_status(
@@ -454,25 +485,14 @@ class TraceManager:
             )
             return None
 
-        random_number = random.random()
-        if random_number > self.sampling_rate:
-            rate_str = f"{self.sampling_rate:.2f}"
-            self._print_trace_status(
-                message=f"Skipped posting trace due to sampling rate ({rate_str})",
-                trace_worker_status=TraceWorkerStatus.SUCCESS,
-            )
+        if not self._should_sample_trace():
             return None
 
         # Add the trace to the queue
         self._trace_queue.put(trace)
 
         # Start the worker thread if it's not already running
-        if self._worker_thread is None or not self._worker_thread.is_alive():
-            self._worker_thread = threading.Thread(
-                target=self._process_trace_queue,
-                daemon=self._daemon,
-            )
-            self._worker_thread.start()
+        self._ensure_worker_thread_running()
 
         return "ok"
 
@@ -493,7 +513,11 @@ class TraceManager:
             nonlocal remaining_trace_request_bodies
             try:
                 # Build API object & payload
-                trace_api = self.create_trace_api(trace_obj)
+                if isinstance(trace_obj, TraceApi):
+                    trace_api = trace_obj
+                else:
+                    trace_api = self.create_trace_api(trace_obj)
+
                 try:
                     body = trace_api.model_dump(
                         by_alias=True,
@@ -502,10 +526,9 @@ class TraceManager:
                 except AttributeError:
                     # Pydantic version below 2.0
                     body = trace_api.dict(by_alias=True, exclude_none=True)
-                print(body)
                 # If the main thread is still alive, send now
                 if main_thr.is_alive():
-                    api = Api()
+                    api = Api(api_key=self.confident_api_key)
                     response = await api.a_send_request(
                         method=HttpMethods.POST,
                         endpoint=Endpoints.TRACING_ENDPOINT,
@@ -591,27 +614,28 @@ class TraceManager:
             message=f"Flushing {len(remaining_trace_request_bodies)} remaining trace(s)",
         )
         for body in remaining_trace_request_bodies:
-            try:
-                api = Api()
-                resp = api.send_request(
-                    method=HttpMethods.POST,
-                    endpoint=Endpoints.TRACING_ENDPOINT,
-                    body=body,
-                )
-                qs = self._trace_queue.qsize()
-                self._print_trace_status(
-                    trace_worker_status=TraceWorkerStatus.SUCCESS,
-                    message=f"Successfully posted trace ({qs} traces remaining in queue, 1 in flight)",
-                    description=resp["link"],
-                    environment=self.environment,
-                )
-            except Exception as e:
-                qs = self._trace_queue.qsize()
-                self._print_trace_status(
-                    trace_worker_status=TraceWorkerStatus.FAILURE,
-                    message="Error flushing remaining trace(s)",
-                    description=str(e),
-                )
+            with capture_send_trace():
+                try:
+                    api = Api(api_key=self.confident_api_key)
+                    resp = api.send_request(
+                        method=HttpMethods.POST,
+                        endpoint=Endpoints.TRACING_ENDPOINT,
+                        body=body,
+                    )
+                    qs = self._trace_queue.qsize()
+                    self._print_trace_status(
+                        trace_worker_status=TraceWorkerStatus.SUCCESS,
+                        message=f"Successfully posted trace ({qs} traces remaining in queue, 1 in flight)",
+                        description=resp["link"],
+                        environment=self.environment,
+                    )
+                except Exception as e:
+                    qs = self._trace_queue.qsize()
+                    self._print_trace_status(
+                        trace_worker_status=TraceWorkerStatus.FAILURE,
+                        message="Error flushing remaining trace(s)",
+                        description=str(e),
+                    )
 
     def create_trace_api(self, trace: Trace) -> TraceApi:
         # Initialize empty lists for each span type
@@ -670,6 +694,10 @@ class TraceManager:
             metadata=trace.metadata,
             tags=trace.tags,
             environment=self.environment,
+            threadId=trace.thread_id,
+            userId=trace.user_id,
+            input=trace.input,
+            output=trace.output,
         )
 
     def _convert_span_to_api_span(self, span: BaseSpan) -> BaseApiSpan:
@@ -884,6 +912,10 @@ class Observer:
                 current_span_context.set(None)
         else:
             current_trace = current_trace_context.get()
+            if current_trace.input is None:
+                current_trace.input = self.function_kwargs
+            if current_trace.output is None:
+                current_trace.output = self.result
             if current_trace and current_trace.uuid == current_span.trace_uuid:
                 other_active_spans = [
                     span
@@ -1004,7 +1036,7 @@ class Observer:
             current_span.output = trace_manager.mask(self.result)
 
     def patch_client(self, client: Any):
- 
+
         if not isinstance(client, OpenAI):
             raise ValueError("client must be an instance of OpenAI")
 
@@ -1053,7 +1085,7 @@ class Observer:
                         model = kwargs.get("model", None)
                         if model is None:
                             raise ValueError("model not found in client")
-                        
+
                         # set model
                         current_span.model = model
 
@@ -1075,7 +1107,7 @@ class Observer:
                         except Exception as e:
                             pass
 
-                        update_current_span_attributes(
+                        update_current_span(
                             LlmAttributes(
                                 input=kwargs.get(
                                     "messages", "INPUT_MESSAGE_NOT_FOUND"
@@ -1207,7 +1239,12 @@ def update_current_span(
 
 
 def update_current_trace(
-    tags: Optional[List[str]] = None, metadata: Optional[Dict[str, Any]] = None
+    tags: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    input: Optional[Any] = None,
+    output: Optional[Any] = None,
 ):
     current_trace = current_trace_context.get()
     if not current_trace:
@@ -1216,3 +1253,11 @@ def update_current_trace(
         current_trace.tags = tags
     if metadata:
         current_trace.metadata = metadata
+    if thread_id:
+        current_trace.thread_id = thread_id
+    if user_id:
+        current_trace.user_id = user_id
+    if input:
+        current_trace.input = input
+    if output:
+        current_trace.output = output
